@@ -47,15 +47,21 @@ def prepare_cookies_file() -> Optional[str]:
 
 def get_ydl_opts(extract_flat: bool = False) -> dict:
     opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best/18",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "default_search": "ytsearch1",
         "source_address": "0.0.0.0",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv_embedded", "android_vr", "web"],
+            }
+        },
     }
     if extract_flat:
-        opts["extract_flat"] = False
+        opts["extract_flat"] = "in_playlist"
+        opts.pop("format", None)
     cookies = prepare_cookies_file()
     if cookies:
         opts["cookiefile"] = cookies
@@ -68,7 +74,7 @@ def search_youtube(song: str, artist: str = "") -> dict:
         raise HTTPException(status_code=400, detail="Missing 'song' parameter")
 
     logger.info("Searching YouTube: %s", query)
-    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+    with yt_dlp.YoutubeDL(get_ydl_opts(extract_flat=True)) as ydl:
         info = ydl.extract_info(f"ytsearch1:{query}", download=False)
         if not info or "entries" not in info or not info["entries"]:
             raise HTTPException(status_code=404, detail="Song not found on YouTube")

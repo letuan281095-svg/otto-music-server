@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-# Cài đặt ffmpeg để chuyển stream YouTube sang MP3 cho ESP32
+# Cài đặt ffmpeg + nodejs (JS runtime cho yt-dlp giải mã YouTube)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+    apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Tạo user không phải root (yêu cầu của Hugging Face Spaces)
