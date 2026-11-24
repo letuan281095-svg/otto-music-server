@@ -47,17 +47,14 @@ def prepare_cookies_file() -> Optional[str]:
 
 def get_ydl_opts(extract_flat: bool = False) -> dict:
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best/18",
+        "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "default_search": "ytsearch1",
         "source_address": "0.0.0.0",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv_embedded", "android_vr", "web"],
-            }
-        },
+        "remote_components": ["ejs:github"],
+        "js_runtimes": {"node": {}},
     }
     if extract_flat:
         opts["extract_flat"] = "in_playlist"
