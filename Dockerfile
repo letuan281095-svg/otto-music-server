@@ -1,8 +1,11 @@
 FROM python:3.11-slim
 
-# Cài đặt ffmpeg + nodejs (JS runtime cho yt-dlp giải mã YouTube)
+# Cài đặt Deno (JS runtime chính thức cho yt-dlp giải mã YouTube)
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
+# Cài đặt ffmpeg để chuyển stream YouTube sang MP3 cho ESP32
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates && \
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Tạo user không phải root (yêu cầu của Hugging Face Spaces)

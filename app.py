@@ -54,7 +54,6 @@ def get_ydl_opts(extract_flat: bool = False) -> dict:
         "default_search": "ytsearch1",
         "source_address": "0.0.0.0",
         "remote_components": ["ejs:github"],
-        "js_runtimes": {"node": {}},
     }
     if extract_flat:
         opts["extract_flat"] = "in_playlist"
@@ -98,11 +97,14 @@ def get_audio_stream_url(video_id: str) -> str:
 
 @app.get("/health")
 def health():
+    deno_ok = os.path.exists("/usr/local/bin/deno")
     return {
         "status": "ok",
         "service": "Otto YouTube Music Server",
         "uptime": int(time.time() - START_TIME),
         "has_cookies": bool(os.environ.get("YOUTUBE_COOKIES", "").strip()),
+        "has_deno": deno_ok,
+        "ytdlp_version": yt_dlp.version.__version__,
     }
 
 
