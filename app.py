@@ -2,8 +2,9 @@ import base64
 import logging
 import os
 import subprocess
+import threading
 import time
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
@@ -24,6 +25,9 @@ app.add_middleware(
 
 COOKIES_PATH = "/tmp/youtube_cookies.txt"
 START_TIME = time.time()
+EXTRACT_LOCK = threading.Lock()
+STREAM_CACHE: Dict[str, Tuple[str, dict, float]] = {}
+STREAM_CACHE_TTL = 1800  # 30 phút
 
 
 def prepare_cookies_file() -> Optional[str]:
@@ -85,14 +89,29 @@ def search_youtube(song: str, artist: str = "") -> dict:
         }
 
 
-def get_audio_stream_url(video_id: str) -> str:
+def get_audio_stream_info(video_id: str) -> Tuple[str, dict]:
+    now = time.time()
+    cached = STREAM_CACHE.get(video_id)
+    if cached and cached[2] > now:
+        logger.info("Using cached stream URL for %s", video_id)
+        return cached[0], cached[1]
+
     url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
-        stream_url = info.get("url")
-        if not stream_url:
-            raise RuntimeError("No audio stream URL found")
-        return stream_url
+    with EXTRACT_LOCK:
+        # Kiểm tra lại cache sau khi vào lock
+        cached = STREAM_CACHE.get(video_id)
+        if cached and cached[2] > time.time():
+            return cached[0], cached[1]
+
+        logger.info("Extracting stream URL for %s", video_id)
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = info.get("url")
+            http_headers = info.get("http_headers") or {}
+            if not stream_url:
+                raise RuntimeError("No audio stream URL found")
+            STREAM_CACHE[video_id] = (stream_url, http_headers, time.time() + STREAM_CACHE_TTL)
+            return stream_url, http_headers
 
 
 @app.get("/health")
@@ -134,25 +153,24 @@ def stream_pcm(
 
 @app.get("/play/{video_id}.mp3")
 def play_mp3(video_id: str):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cookies = prepare_cookies_file()
-
-    ytdlp_cmd = [
-        "yt-dlp",
-        "-f", "bestaudio/best",
-        "--no-playlist",
-        "--quiet",
-        "--no-warnings",
-        "--remote-components", "ejs:github",
-        "-o", "-",
-    ]
-    if cookies:
-        ytdlp_cmd += ["--cookies", cookies]
-    ytdlp_cmd.append(url)
+    try:
+        stream_url, http_headers = get_audio_stream_info(video_id)
+    except Exception as e:
+        logger.error("Failed to extract audio for %s: %s", video_id, e)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch YouTube audio: {e}")
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-i", "pipe:0",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+    ]
+    if http_headers:
+        header_str = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+        ffmpeg_cmd += ["-headers", header_str]
+
+    ffmpeg_cmd += [
+        "-i", stream_url,
         "-vn",
         "-f", "mp3",
         "-ab", "128k",
@@ -163,45 +181,32 @@ def play_mp3(video_id: str):
     ]
 
     def generate():
-        ytdlp_proc = subprocess.Popen(
-            ytdlp_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        ffmpeg_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             ffmpeg_cmd,
-            stdin=ytdlp_proc.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=16384,
         )
-        # Cho phép ytdlp nhận SIGPIPE nếu ffmpeg dừng trước
-        if ytdlp_proc.stdout:
-            ytdlp_proc.stdout.close()
         try:
             while True:
-                chunk = ffmpeg_proc.stdout.read(8192)
+                chunk = proc.stdout.read(8192)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            for proc in (ffmpeg_proc, ytdlp_proc):
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                if proc.stdout:
-                    try:
-                        proc.stdout.close()
-                    except Exception:
-                        pass
-                if proc.stderr:
-                    try:
-                        proc.stderr.close()
-                    except Exception:
-                        pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if proc.stderr:
+                err = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+                if err:
+                    logger.warning("ffmpeg stderr (%s): %s", video_id, err)
+                proc.stderr.close()
+            if proc.stdout:
+                proc.stdout.close()
 
     return StreamingResponse(
         generate(),
