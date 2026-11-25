@@ -134,18 +134,25 @@ def stream_pcm(
 
 @app.get("/play/{video_id}.mp3")
 def play_mp3(video_id: str):
-    try:
-        stream_url = get_audio_stream_url(video_id)
-    except Exception as e:
-        logger.error("Failed to get stream URL for %s: %s", video_id, e)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch YouTube audio: {e}")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookies = prepare_cookies_file()
+
+    ytdlp_cmd = [
+        "yt-dlp",
+        "-f", "bestaudio/best",
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+        "--remote-components", "ejs:github",
+        "-o", "-",
+    ]
+    if cookies:
+        ytdlp_cmd += ["--cookies", cookies]
+    ytdlp_cmd.append(url)
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        "-i", stream_url,
+        "-i", "pipe:0",
         "-vn",
         "-f", "mp3",
         "-ab", "128k",
@@ -156,29 +163,45 @@ def play_mp3(video_id: str):
     ]
 
     def generate():
-        proc = subprocess.Popen(
+        ytdlp_proc = subprocess.Popen(
+            ytdlp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
+            stdin=ytdlp_proc.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=16384,
         )
+        # Cho phép ytdlp nhận SIGPIPE nếu ffmpeg dừng trước
+        if ytdlp_proc.stdout:
+            ytdlp_proc.stdout.close()
         try:
             while True:
-                chunk = proc.stdout.read(8192)
+                chunk = ffmpeg_proc.stdout.read(8192)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
+            for proc in (ffmpeg_proc, ytdlp_proc):
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                if proc.stdout:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+                if proc.stderr:
+                    try:
+                        proc.stderr.close()
+                    except Exception:
+                        pass
 
     return StreamingResponse(
         generate(),
