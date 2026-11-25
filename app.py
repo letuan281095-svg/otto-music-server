@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("otto-music")
 
-app = FastAPI(title="Otto YouTube Music Server")
+app = FastAPI(title="Otto Music Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,17 +26,18 @@ app.add_middleware(
 COOKIES_PATH = "/tmp/youtube_cookies.txt"
 START_TIME = time.time()
 EXTRACT_LOCK = threading.Lock()
-STREAM_CACHE: Dict[str, Tuple[str, dict, float]] = {}
+
+# Cache: track_key -> (stream_url, http_headers, webpage_url, expires_at)
+STREAM_CACHE: Dict[str, Tuple[str, dict, str, float]] = {}
 STREAM_CACHE_TTL = 1800  # 30 phút
 
 
 def prepare_cookies_file() -> Optional[str]:
-    """Tạo file cookies từ biến môi trường YOUTUBE_COOKIES (nếu có)."""
+    """Tạo file cookies YouTube từ biến môi trường YOUTUBE_COOKIES (nếu có)."""
     raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if not raw:
         return None
     try:
-        # Hỗ trợ cả dạng text Netscape trực tiếp hoặc base64
         if "# Netscape HTTP Cookie File" not in raw and "\t" not in raw:
             decoded = base64.b64decode(raw).decode("utf-8", errors="ignore")
             if "\t" in decoded:
@@ -49,80 +50,177 @@ def prepare_cookies_file() -> Optional[str]:
         return None
 
 
-def get_ydl_opts(extract_flat: bool = False) -> dict:
+def pick_best_audio_url(entry: dict) -> Tuple[Optional[str], dict]:
+    """Chọn URL audio tốt nhất (tránh bản preview 30s của SoundCloud Go+)."""
+    headers = entry.get("http_headers") or {}
+    formats = entry.get("formats") or []
+
+    # Ưu tiên progressive mp3/m4a không phải preview
+    full_formats = [
+        f for f in formats
+        if f.get("url")
+        and "preview" not in str(f.get("format_id", "")).lower()
+        and "preview" not in str(f.get("url", "")).lower()
+    ]
+    candidates = full_formats or [f for f in formats if f.get("url")]
+
+    if candidates:
+        # Ưu tiên http mp3 trước, rồi đến hls mp3, rồi bất kỳ audio nào
+        def score(f: dict) -> tuple:
+            proto = str(f.get("protocol", "")).lower()
+            ext = str(f.get("ext", "")).lower()
+            is_http = 1 if proto in ("http", "https") else 0
+            is_mp3 = 1 if ext == "mp3" else 0
+            abr = float(f.get("abr") or f.get("tbr") or 0)
+            return (is_http, is_mp3, abr)
+
+        best = max(candidates, key=score)
+        return best["url"], best.get("http_headers") or headers
+
+    return entry.get("url"), headers
+
+
+def search_soundcloud(query: str) -> Optional[dict]:
+    """Tìm nhạc trên SoundCloud (không cần cookies, không bị chặn IP cloud)."""
+    opts = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "source_address": "0.0.0.0",
+        "format": "bestaudio/best",
+    }
+    try:
+        logger.info("Searching SoundCloud: %s", query)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"scsearch5:{query}", download=False)
+            entries = [e for e in (info.get("entries") or []) if e] if info else []
+            if not entries:
+                return None
+
+            # Ưu tiên bài đầy đủ (duration >= 60s) và có link không phải preview
+            valid = []
+            for e in entries:
+                stream_url, headers = pick_best_audio_url(e)
+                if not stream_url:
+                    continue
+                dur = int(e.get("duration") or 0)
+                is_preview = "preview" in stream_url.lower()
+                valid.append((not is_preview, dur >= 60, dur, e, stream_url, headers))
+
+            if not valid:
+                return None
+
+            # Chọn bài tốt nhất (ưu tiên không phải preview và dài >= 60s; giữ thứ tự relevance trong nhóm tốt nhất)
+            best_group = [v for v in valid if v[0] and v[1]]
+            chosen = best_group[0] if best_group else max(valid, key=lambda x: (x[0], x[1], x[2]))
+            _, _, dur, entry, stream_url, headers = chosen
+
+            track_id = f"sc_{entry.get('id', int(time.time()))}"
+            webpage_url = entry.get("webpage_url") or ""
+            STREAM_CACHE[track_id] = (stream_url, headers, webpage_url, time.time() + STREAM_CACHE_TTL)
+
+            return {
+                "track_id": track_id,
+                "title": entry.get("title") or query,
+                "artist": entry.get("uploader") or "SoundCloud",
+                "duration": dur,
+                "source": "soundcloud",
+            }
+    except Exception as e:
+        logger.warning("SoundCloud search error for '%s': %s", query, e)
+        return None
+
+
+def search_youtube(query: str) -> Optional[dict]:
+    """Dự phòng: tìm nhạc trên YouTube (dùng cookies nếu có)."""
     opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "default_search": "ytsearch1",
         "source_address": "0.0.0.0",
         "remote_components": ["ejs:github"],
     }
-    if extract_flat:
-        opts["extract_flat"] = "in_playlist"
-        opts.pop("format", None)
     cookies = prepare_cookies_file()
     if cookies:
         opts["cookiefile"] = cookies
-    return opts
+
+    try:
+        logger.info("Searching YouTube fallback: %s", query)
+        with EXTRACT_LOCK:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+                entries = [e for e in (info.get("entries") or []) if e] if info else []
+                if not entries:
+                    return None
+                entry = entries[0]
+                stream_url, headers = pick_best_audio_url(entry)
+                if not stream_url:
+                    return None
+
+                vid = entry.get("id", "")
+                if not vid:
+                    return None
+                webpage_url = entry.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+                STREAM_CACHE[vid] = (stream_url, headers, webpage_url, time.time() + STREAM_CACHE_TTL)
+
+                return {
+                    "track_id": vid,
+                    "title": entry.get("title") or query,
+                    "artist": entry.get("uploader") or "YouTube",
+                    "duration": int(entry.get("duration") or 0),
+                    "source": "youtube",
+                }
+    except Exception as e:
+        logger.warning("YouTube fallback error for '%s': %s", query, e)
+        return None
 
 
-def search_youtube(song: str, artist: str = "") -> dict:
-    query = f"{song} {artist}".strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Missing 'song' parameter")
-
-    logger.info("Searching YouTube: %s", query)
-    with yt_dlp.YoutubeDL(get_ydl_opts(extract_flat=True)) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        if not info or "entries" not in info or not info["entries"]:
-            raise HTTPException(status_code=404, detail="Song not found on YouTube")
-        entry = info["entries"][0]
-        if not entry:
-            raise HTTPException(status_code=404, detail="Song not found on YouTube")
-        return {
-            "id": entry.get("id", ""),
-            "title": entry.get("title") or song,
-            "artist": entry.get("uploader") or artist or "YouTube",
-            "duration": int(entry.get("duration") or 0),
-        }
-
-
-def get_audio_stream_info(video_id: str) -> Tuple[str, dict]:
+def resolve_stream_for_play(track_id: str) -> Tuple[str, dict]:
     now = time.time()
-    cached = STREAM_CACHE.get(video_id)
-    if cached and cached[2] > now:
-        logger.info("Using cached stream URL for %s", video_id)
+    cached = STREAM_CACHE.get(track_id)
+    if cached and cached[3] > now:
         return cached[0], cached[1]
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    with EXTRACT_LOCK:
-        # Kiểm tra lại cache sau khi vào lock
-        cached = STREAM_CACHE.get(video_id)
-        if cached and cached[2] > time.time():
-            return cached[0], cached[1]
+    # Nếu cache hết hạn hoặc bị restart, lấy lại từ webpage_url hoặc YouTube ID
+    webpage_url = cached[2] if cached and cached[2] else ""
+    if not webpage_url:
+        if track_id.startswith("sc_"):
+            raise HTTPException(status_code=404, detail="Track cache expired, please search again")
+        webpage_url = f"https://www.youtube.com/watch?v={track_id}"
 
-        logger.info("Extracting stream URL for %s", video_id)
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
-            stream_url = info.get("url")
-            http_headers = info.get("http_headers") or {}
+    opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "source_address": "0.0.0.0",
+    }
+    if not track_id.startswith("sc_"):
+        opts["remote_components"] = ["ejs:github"]
+        cookies = prepare_cookies_file()
+        if cookies:
+            opts["cookiefile"] = cookies
+
+    with EXTRACT_LOCK:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(webpage_url, download=False)
+            stream_url, headers = pick_best_audio_url(info)
             if not stream_url:
-                raise RuntimeError("No audio stream URL found")
-            STREAM_CACHE[video_id] = (stream_url, http_headers, time.time() + STREAM_CACHE_TTL)
-            return stream_url, http_headers
+                raise RuntimeError("No playable audio stream found")
+            STREAM_CACHE[track_id] = (stream_url, headers, webpage_url, time.time() + STREAM_CACHE_TTL)
+            return stream_url, headers
 
 
 @app.get("/health")
 def health():
-    deno_ok = os.path.exists("/usr/local/bin/deno")
     return {
         "status": "ok",
-        "service": "Otto YouTube Music Server",
+        "service": "Otto Music Server (SoundCloud + YouTube)",
         "uptime": int(time.time() - START_TIME),
+        "cached_tracks": len(STREAM_CACHE),
         "has_cookies": bool(os.environ.get("YOUTUBE_COOKIES", "").strip()),
-        "has_deno": deno_ok,
         "ytdlp_version": yt_dlp.version.__version__,
     }
 
@@ -133,31 +231,38 @@ def stream_pcm(
     song: str = Query(..., description="Tên bài hát"),
     artist: str = Query("", description="Tên ca sĩ (tùy chọn)"),
 ):
+    query = f"{song} {artist}".strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Missing 'song' parameter")
+
+    # Ưu tiên SoundCloud (ổn định 100%, không cần cookies, không chặn IP cloud)
+    result = search_soundcloud(query)
+
+    # Nếu SoundCloud không có bài, thử dự phòng YouTube
+    if not result:
+        result = search_youtube(query)
+
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy bài hát '{query}'")
+
+    return {
+        "title": result["title"],
+        "artist": result["artist"],
+        "audio_url": f"/play/{result['track_id']}.mp3",
+        "duration": result["duration"],
+        "source": result["source"],
+    }
+
+
+@app.get("/play/{track_id}.mp3")
+def play_mp3(track_id: str):
     try:
-        result = search_youtube(song, artist)
-        video_id = result["id"]
-        if not video_id:
-            raise HTTPException(status_code=404, detail="Video ID not found")
-        return {
-            "title": result["title"],
-            "artist": result["artist"],
-            "audio_url": f"/play/{video_id}.mp3",
-            "duration": result["duration"],
-        }
+        stream_url, http_headers = resolve_stream_for_play(track_id)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Search error for '%s': %s", song, e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/play/{video_id}.mp3")
-def play_mp3(video_id: str):
-    try:
-        stream_url, http_headers = get_audio_stream_info(video_id)
-    except Exception as e:
-        logger.error("Failed to extract audio for %s: %s", video_id, e)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch YouTube audio: {e}")
+        logger.error("Failed to resolve stream for %s: %s", track_id, e)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch audio: {e}")
 
     ffmpeg_cmd = [
         "ffmpeg",
@@ -203,7 +308,7 @@ def play_mp3(video_id: str):
             if proc.stderr:
                 err = proc.stderr.read().decode("utf-8", errors="ignore").strip()
                 if err:
-                    logger.warning("ffmpeg stderr (%s): %s", video_id, err)
+                    logger.warning("ffmpeg stderr (%s): %s", track_id, err)
                 proc.stderr.close()
             if proc.stdout:
                 proc.stdout.close()
@@ -218,14 +323,14 @@ def play_mp3(video_id: str):
     )
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
 <html lang="vi">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Otto YouTube Music Server</title>
+  <title>Otto Music Server</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; max-width: 640px; margin: 40px auto; padding: 0 16px; }
     .card { background: #1e293b; padding: 20px; border-radius: 12px; }
@@ -238,10 +343,10 @@ def index():
 </head>
 <body>
   <div class="card">
-    <h2>🎵 Otto YouTube Music Server</h2>
-    <p>Test nhanh API <code>/stream_pcm</code> cho Xiaozhi / Otto Robot:</p>
+    <h2>🎵 Otto Music Server</h2>
+    <p>Nguồn phát nhạc ổn định 24/7 (SoundCloud + YouTube fallback) cho <b>Otto Robot / Xiaozhi ESP32</b>:</p>
     <input id="song" placeholder="Tên bài hát (vd: Lạc Trôi)" value="Lạc Trôi" />
-    <input id="artist" placeholder="Ca sĩ (tùy chọn, vd: Sơn Tùng)" />
+    <input id="artist" placeholder="Ca sĩ (tùy chọn, vd: Sơn Tùng)" value="Sơn Tùng" />
     <button onclick="testSong()">Tìm & Phát thử</button>
     <pre id="out">Sẵn sàng...</pre>
     <audio id="player" controls></audio>
@@ -252,7 +357,7 @@ def index():
       const artist = document.getElementById('artist').value;
       const out = document.getElementById('out');
       const player = document.getElementById('player');
-      out.textContent = 'Đang tìm trên YouTube...';
+      out.textContent = 'Đang tìm bài hát...';
       try {
         const res = await fetch('/stream_pcm?song=' + encodeURIComponent(song) + '&artist=' + encodeURIComponent(artist));
         const data = await res.json();
